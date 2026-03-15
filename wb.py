@@ -148,6 +148,12 @@ async def db_init() -> None:
                 chat_id INTEGER PRIMARY KEY,
                 title   TEXT DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS message_log (
+                chat_id    INTEGER NOT NULL,
+                user_id    INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, user_id, message_id)
+            );
         """)
         await db.commit()
 
@@ -376,6 +382,14 @@ class IsGroupAdmin(Filter):
         if not result:
             await message.reply("⛔ Недостаточно прав.")
         return result
+
+
+class IsOwner(Filter):
+    async def __call__(self, message: Message) -> bool:
+        if message.from_user.id not in OWNER_IDS:
+            await message.reply("⛔ Только для владельцев бота.")
+            return False
+        return True
 
 
 async def get_panel_chat_id(message: Message) -> Optional[int]:
@@ -928,6 +942,69 @@ async def cmd_ban(message: Message, command: CommandObject) -> None:
         f"🚫 {user_mention(target)} <b>заблокирован</b>\n📝 Причина: {reason}",
         30,
     )
+
+
+@router.message(Command("thanosdelete"), IsOwner())
+async def cmd_thanosdelete(message: Message, command: CommandObject) -> None:
+    """Удаляет все сообщения пользователя во всех группах и банит его везде."""
+    target = await get_target(message)
+    if target:
+        target_id = target.id
+        target_name = user_mention(target)
+    elif command.args and command.args.strip().lstrip("-").isdigit():
+        target_id = int(command.args.strip())
+        target_name = f'<a href="tg://user?id={target_id}">{target_id}</a>'
+    else:
+        await notify(message.chat.id, "⚠️ Укажи цель: реплай или user_id.", 10)
+        return
+
+    if target_id in OWNER_IDS:
+        await notify(message.chat.id, "⛔ Нельзя применить к владельцу.", 10)
+        return
+
+    await safe_delete(message.chat.id, message.message_id)
+    status_msg = await message.answer("⏳ Thanos удаляет...")
+
+    chats = await get_known_chats()
+    total_deleted = 0
+    banned_in = 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for chat_id, _ in chats:
+            # Получаем все сохранённые message_id пользователя в этом чате
+            async with db.execute(
+                "SELECT message_id FROM message_log WHERE chat_id=? AND user_id=?",
+                (chat_id, target_id),
+            ) as cur:
+                msg_ids = [row[0] for row in await cur.fetchall()]
+
+            # Удаляем пачками по 100
+            for i in range(0, len(msg_ids), 100):
+                batch = msg_ids[i : i + 100]
+                try:
+                    await bot.delete_messages(chat_id, batch)
+                    total_deleted += len(batch)
+                except Exception:
+                    pass
+
+            # Баним в чате
+            try:
+                await bot.ban_chat_member(chat_id, target_id)
+                banned_in += 1
+            except Exception:
+                pass
+
+        # Удаляем лог сообщений юзера
+        await db.execute("DELETE FROM message_log WHERE user_id=?", (target_id,))
+        await db.commit()
+
+    await status_msg.edit_text(
+        f"🌪 <b>Thanos snap!</b>\n"
+        f"Пользователь {target_name}:\n"
+        f"• Удалено сообщений: <b>{total_deleted}</b>\n"
+        f"• Забанен в группах: <b>{banned_in}/{len(chats)}</b>"
+    )
+    asyncio.create_task(auto_delete(status_msg, 30))
 
 
 @router.message(Command("unban"), IsGroupAdmin())
@@ -1488,6 +1565,24 @@ async def filter_messages(message: Message) -> None:
     chat_id = message.chat.id
 
     await register_chat(chat_id, message.chat.title or "")
+
+    # Логируем message_id для /thanosdelete
+    async with aiosqlite.connect(DB_PATH) as _db:
+        await _db.execute(
+            "INSERT OR IGNORE INTO message_log(chat_id, user_id, message_id) VALUES(?,?,?)",
+            (chat_id, uid, message.message_id),
+        )
+        # Хранить только последние 10000 сообщений пользователя в чате
+        await _db.execute(
+            """DELETE FROM message_log WHERE rowid IN (
+                SELECT rowid FROM message_log
+                WHERE chat_id=? AND user_id=?
+                ORDER BY message_id DESC
+                LIMIT -1 OFFSET 10000
+            )""",
+            (chat_id, uid),
+        )
+        await _db.commit()
 
     # Admins are exempt from all filters
     if await is_admin(chat_id, uid):
