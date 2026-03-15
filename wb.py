@@ -49,6 +49,7 @@ load_dotenv()
 TOKEN: str = os.getenv("BOT_TOKEN", "")
 OWNER_IDS: list[int] = [int(x) for x in os.getenv("OWNER_IDS", "382254550").split(",") if x.strip()]
 DB_PATH: str = os.getenv("DB_PATH", "wb_v2.db")
+GLOBAL_SUB_CHANNEL: int = -1001605638152  # глобальный канал для проверки подписки
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +65,8 @@ dp.include_router(router)
 
 # In-memory flood tracker: {chat_id: {user_id: [timestamps]}}
 flood_tracker: dict[int, dict[int, list[float]]] = {}
+# Выбранная группа владельца в личке: {user_id: chat_id}
+active_panel: dict[int, int] = {}
 FLOOD_LIMIT = 5   # messages in window
 FLOOD_WINDOW = 5  # seconds
 
@@ -140,6 +143,10 @@ async def db_init() -> None:
                 answer     TEXT,
                 message_id INTEGER,
                 PRIMARY KEY (chat_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS known_chats (
+                chat_id INTEGER PRIMARY KEY,
+                title   TEXT DEFAULT ''
             );
         """)
         await db.commit()
@@ -275,8 +282,15 @@ async def do_warn(chat_id: int, user_id: int, issued_by: int, reason: str = "—
 
 
 async def do_ban(chat_id: int, user_id: int, reason: str = "—") -> None:
-    await bot.ban_chat_member(chat_id, user_id)
-    log.info(f"[{chat_id}] Banned {user_id}: {reason}")
+    """Банит пользователя во всех известных группах."""
+    chats = await get_known_chats()
+    targets = {c[0] for c in chats} | {chat_id}
+    for cid in targets:
+        try:
+            await bot.ban_chat_member(cid, user_id)
+        except Exception as e:
+            log.warning(f"[global ban] {user_id} in {cid}: {e}")
+    log.info(f"[global] Banned {user_id} across {len(targets)} chats: {reason}")
 
 
 async def do_kick(chat_id: int, user_id: int) -> None:
@@ -332,6 +346,25 @@ async def do_unmute(chat_id: int, user_id: int) -> None:
         await db.commit()
 
 
+async def register_chat(chat_id: int, title: str = "") -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO known_chats (chat_id, title) VALUES (?,?)",
+            (chat_id, title),
+        )
+        if title:
+            await db.execute(
+                "UPDATE known_chats SET title=? WHERE chat_id=?", (title, chat_id)
+            )
+        await db.commit()
+
+
+async def get_known_chats() -> list[tuple[int, str]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT chat_id, title FROM known_chats") as cur:
+            return await cur.fetchall()
+
+
 # ─── FILTERS ───────────────────────────────────────────────────────────────────
 
 class IsGroupAdmin(Filter):
@@ -345,15 +378,63 @@ class IsGroupAdmin(Filter):
         return result
 
 
+async def get_panel_chat_id(message: Message) -> Optional[int]:
+    """
+    Возвращает effective chat_id для команды.
+    В группе — ID группы (если пользователь — admin).
+    В личке — ID выбранной группы из active_panel (только для владельцев).
+    """
+    uid = message.from_user.id
+    if message.chat.type == ChatType.PRIVATE:
+        if uid not in OWNER_IDS:
+            await message.answer("⛔ Эта команда доступна только владельцам.")
+            return None
+        chat_id = active_panel.get(uid)
+        if not chat_id:
+            await message.answer(
+                "Сначала выберите группу через /panel"
+            )
+            return None
+        return chat_id
+    else:
+        if not await is_admin(message.chat.id, uid):
+            await message.reply("⛔ Недостаточно прав.")
+            return None
+        return message.chat.id
+
+
+def build_panel_keyboard(chat_id: int, anti_links: int, sub_check: int,
+                         captcha: int, night_mode: int) -> InlineKeyboardMarkup:
+    def toggle(val: int) -> str:
+        return "✅" if val else "❌"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"🔗 Анти-ссылки {toggle(anti_links)}",
+              callback_data=f"ptoggle:anti_links:{chat_id}")
+    kb.button(text=f"📡 Подписка {toggle(sub_check)}",
+              callback_data=f"ptoggle:sub_check:{chat_id}")
+    kb.button(text=f"🤖 Капча {toggle(captcha)}",
+              callback_data=f"ptoggle:captcha:{chat_id}")
+    kb.button(text=f"🌙 Ночной режим {toggle(night_mode)}",
+              callback_data=f"ptoggle:night_mode:{chat_id}")
+    kb.button(text="📜 Правила", callback_data=f"pview:rules:{chat_id}")
+    kb.button(text="👋 Приветствие", callback_data=f"pview:welcome:{chat_id}")
+    kb.button(text="↩️ К группам", callback_data="panel:list")
+    kb.adjust(2, 2, 2, 1)
+    return kb.as_markup()
+
+
 # ─── /start ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     if message.chat.type == ChatType.PRIVATE:
+        owner_hint = "\n\n👑 Вы — владелец. Используйте /panel для управления группами." \
+            if message.from_user.id in OWNER_IDS else ""
         await message.answer(
             "👋 <b>WB-BOT V2</b> — Умный модератор для вашей группы!\n\n"
             "Добавьте меня в группу и назначьте администратором.\n"
-            "Напишите /help для списка команд."
+            f"Напишите /help для списка команд.{owner_hint}"
         )
     else:
         uid = message.from_user.id
@@ -381,7 +462,8 @@ HELP_USER = """📖 <b>Команды для пользователей:</b>
 /status — мой статус
 /id — узнать ID
 /warnings — мои предупреждения
-/report — пожаловаться (ответьте на сообщение)""".strip()
+/report — пожаловаться (ответьте на сообщение)
+/panel — панель управления группами (личка, только владельцы)""".strip()
 
 HELP_ADMIN = """
 🛡️ <b>Команды администратора:</b>
@@ -438,12 +520,150 @@ async def cmd_help(message: Message) -> None:
         await message.answer(text)
 
 
+# ─── /panel ────────────────────────────────────────────────────────────────────
+
+@router.message(Command("panel"))
+async def cmd_panel(message: Message) -> None:
+    uid = message.from_user.id
+    if uid not in OWNER_IDS:
+        if message.chat.type != ChatType.PRIVATE:
+            await safe_delete(message.chat.id, message.message_id)
+        return
+    if message.chat.type != ChatType.PRIVATE:
+        await safe_delete(message.chat.id, message.message_id)
+        await notify(message.chat.id, "Панель управления доступна только в личке с ботом.", 10)
+        return
+    chats = await get_known_chats()
+    if not chats:
+        await message.answer("Бот ещё не добавлен ни в одну группу.")
+        return
+    kb = InlineKeyboardBuilder()
+    for cid, title in chats:
+        kb.button(text=title or str(cid), callback_data=f"panel:select:{cid}")
+    kb.adjust(1)
+    await message.answer("🎛 <b>Выберите группу для управления:</b>", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("panel:"))
+async def panel_callback(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    if uid not in OWNER_IDS:
+        await callback.answer("Только для владельцев.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    action = parts[1]
+
+    if action == "list":
+        chats = await get_known_chats()
+        if not chats:
+            await callback.answer("Нет известных групп.", show_alert=True)
+            return
+        kb = InlineKeyboardBuilder()
+        for cid, title in chats:
+            kb.button(text=title or str(cid), callback_data=f"panel:select:{cid}")
+        kb.adjust(1)
+        await callback.message.edit_text(
+            "🎛 <b>Выберите группу для управления:</b>",
+            reply_markup=kb.as_markup(),
+        )
+        return
+
+    if action == "select":
+        chat_id = int(parts[2])
+        active_panel[uid] = chat_id
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR IGNORE INTO chat_settings (chat_id) VALUES (?)", (chat_id,))
+            await db.commit()
+            async with db.execute(
+                "SELECT anti_links, sub_check, max_warns, night_mode, night_start, night_end, captcha "
+                "FROM chat_settings WHERE chat_id=?", (chat_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        if not row:
+            await callback.answer("Ошибка получения настроек.", show_alert=True)
+            return
+        anti_links, sub_check, max_warns, night_mode, night_start, night_end, captcha = row
+        chats = await get_known_chats()
+        title = next((t for c, t in chats if c == chat_id), str(chat_id))
+        text = (
+            f"⚙️ <b>Управление: {title}</b>\n\n"
+            f"⚠️ Авто-бан после: <b>{max_warns}</b> предупреждений\n"
+            f"📡 Канал подписки: <code>{GLOBAL_SUB_CHANNEL}</code>\n"
+            f"🌙 Ночной режим: {night_start}:00–{night_end}:00\n\n"
+            f"Используйте /setrules, /setwelcome, /setmaxwarns, /nightmode в этом чате."
+        )
+        await callback.message.edit_text(
+            text,
+            reply_markup=build_panel_keyboard(chat_id, anti_links, sub_check, captcha, night_mode),
+        )
+        await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ptoggle:"))
+async def ptoggle_callback(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    if uid not in OWNER_IDS:
+        await callback.answer("Только для владельцев.", show_alert=True)
+        return
+    _, setting, chat_id_str = callback.data.split(":")
+    chat_id = int(chat_id_str)
+    current = await get_setting(chat_id, setting)
+    new_val = 0 if current else 1
+    await set_setting(chat_id, setting, new_val)
+    # Refresh panel
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT anti_links, sub_check, captcha, night_mode "
+            "FROM chat_settings WHERE chat_id=?", (chat_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        await callback.answer("Ошибка.", show_alert=True)
+        return
+    anti_links, sub_check, captcha, night_mode = row
+    await callback.message.edit_reply_markup(
+        reply_markup=build_panel_keyboard(chat_id, anti_links, sub_check, captcha, night_mode)
+    )
+    labels = {
+        "anti_links": "Анти-ссылки",
+        "sub_check": "Проверка подписки",
+        "captcha": "Капча",
+        "night_mode": "Ночной режим",
+    }
+    state = "включён" if new_val else "отключён"
+    await callback.answer(f"{labels.get(setting, setting)}: {state}")
+
+
+@router.callback_query(F.data.startswith("pview:"))
+async def pview_callback(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    if uid not in OWNER_IDS:
+        await callback.answer("Только для владельцев.", show_alert=True)
+        return
+    _, what, chat_id_str = callback.data.split(":")
+    chat_id = int(chat_id_str)
+    if what == "rules":
+        rules = await get_setting(chat_id, "rules")
+        text = f"📜 <b>Текущие правила:</b>\n\n{rules or '(не установлены)'}\n\n" \
+               f"Чтобы изменить: /setrules <текст>"
+    else:
+        welcome = await get_setting(chat_id, "welcome_msg")
+        text = f"👋 <b>Текущее приветствие:</b>\n\n{welcome or '(не установлено)'}\n\n" \
+               f"Чтобы изменить: /setwelcome <текст> (используйте {{name}})"
+    await callback.answer(text[:200], show_alert=True)
+
+
 # ─── /rules ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("rules"))
 async def cmd_rules(message: Message) -> None:
     if message.chat.type == ChatType.PRIVATE:
-        await message.answer("Эта команда работает только в группах.")
+        chat_id = await get_panel_chat_id(message)
+        if not chat_id:
+            return
+        rules = await get_setting(chat_id, "rules")
+        text = f"📜 <b>Правила чата:</b>\n\n{rules}" if rules else "Правила ещё не установлены."
+        await message.answer(text)
         return
     rules = await get_setting(message.chat.id, "rules")
     text = f"📜 <b>Правила чата:</b>\n\n{rules}" if rules else "Правила ещё не установлены."
@@ -452,24 +672,44 @@ async def cmd_rules(message: Message) -> None:
     asyncio.create_task(auto_delete(msg, 60))
 
 
-@router.message(Command("setrules"), IsGroupAdmin())
+@router.message(Command("setrules"))
 async def cmd_setrules(message: Message, command: CommandObject) -> None:
-    if not command.args:
-        await notify(message.chat.id, "Укажите текст: /setrules <текст>", 10)
+    chat_id = await get_panel_chat_id(message)
+    if not chat_id:
         return
-    await set_setting(message.chat.id, "rules", command.args)
-    await safe_delete(message.chat.id, message.message_id)
-    await notify(message.chat.id, "✅ Правила обновлены.", 10)
+    if not command.args:
+        text = "Укажите текст: /setrules <текст>"
+        if message.chat.type == ChatType.PRIVATE:
+            await message.answer(text)
+        else:
+            await notify(chat_id, text, 10)
+        return
+    await set_setting(chat_id, "rules", command.args)
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("✅ Правила обновлены.")
+    else:
+        await safe_delete(chat_id, message.message_id)
+        await notify(chat_id, "✅ Правила обновлены.", 10)
 
 
-@router.message(Command("setwelcome"), IsGroupAdmin())
+@router.message(Command("setwelcome"))
 async def cmd_setwelcome(message: Message, command: CommandObject) -> None:
-    if not command.args:
-        await notify(message.chat.id, "Укажите текст: /setwelcome <текст> (используйте {name})", 10)
+    chat_id = await get_panel_chat_id(message)
+    if not chat_id:
         return
-    await set_setting(message.chat.id, "welcome_msg", command.args)
-    await safe_delete(message.chat.id, message.message_id)
-    await notify(message.chat.id, "✅ Приветствие обновлено.", 10)
+    if not command.args:
+        text = "Укажите текст: /setwelcome <текст> (используйте {name})"
+        if message.chat.type == ChatType.PRIVATE:
+            await message.answer(text)
+        else:
+            await notify(chat_id, text, 10)
+        return
+    await set_setting(chat_id, "welcome_msg", command.args)
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer("✅ Приветствие обновлено.")
+    else:
+        await safe_delete(chat_id, message.message_id)
+        await notify(chat_id, "✅ Приветствие обновлено.", 10)
 
 
 # ─── /status ───────────────────────────────────────────────────────────────────
@@ -920,117 +1160,164 @@ async def cmd_words(message: Message) -> None:
 
 # ─── SETTINGS ──────────────────────────────────────────────────────────────────
 
-@router.message(Command("settings"), IsGroupAdmin())
+@router.message(Command("settings"))
 async def cmd_settings(message: Message) -> None:
-    chat_id = message.chat.id
+    chat_id = await get_panel_chat_id(message)
+    if not chat_id:
+        return
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO chat_settings (chat_id) VALUES (?)", (chat_id,)
         )
         await db.commit()
         async with db.execute(
-            "SELECT anti_links, sub_check, sub_channel, max_warns, "
+            "SELECT anti_links, sub_check, max_warns, "
             "night_mode, night_start, night_end, captcha "
             "FROM chat_settings WHERE chat_id=?",
             (chat_id,),
         ) as cur:
             row = await cur.fetchone()
     if not row:
-        await notify(chat_id, "Ошибка получения настроек.", 10)
+        if message.chat.type == ChatType.PRIVATE:
+            await message.answer("Ошибка получения настроек.")
+        else:
+            await notify(chat_id, "Ошибка получения настроек.", 10)
         return
-    anti_links, sub_check, sub_channel, max_warns, night_mode, night_start, night_end, captcha = row
+    anti_links, sub_check, max_warns, night_mode, night_start, night_end, captcha = row
     text = (
         f"⚙️ <b>Настройки чата</b>\n\n"
         f"🔗 Фильтр ссылок: {'✅' if anti_links else '❌'}\n"
-        f"📡 Проверка подписки: {'✅' if sub_check else '❌'}"
-        f"{' (' + sub_channel + ')' if sub_channel else ''}\n"
+        f"📡 Проверка подписки: {'✅' if sub_check else '❌'} (канал: <code>{GLOBAL_SUB_CHANNEL}</code>)\n"
         f"⚠️ Авто-бан после: {max_warns} предупреждений\n"
         f"🌙 Ночной режим: {'✅' if night_mode else '❌'}"
         f"{f' ({night_start}:00–{night_end}:00)' if night_mode else ''}\n"
         f"🤖 Капча для новых: {'✅' if captcha else '❌'}"
     )
-    await safe_delete(chat_id, message.message_id)
-    await notify(chat_id, text, 30)
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer(text, reply_markup=build_panel_keyboard(
+            chat_id, anti_links, sub_check, captcha, night_mode))
+    else:
+        await safe_delete(chat_id, message.message_id)
+        await notify(chat_id, text, 30)
 
 
-@router.message(Command("setmaxwarns"), IsGroupAdmin())
+@router.message(Command("setmaxwarns"))
 async def cmd_setmaxwarns(message: Message, command: CommandObject) -> None:
+    chat_id = await get_panel_chat_id(message)
+    if not chat_id:
+        return
     if not command.args or not command.args.strip().isdigit():
-        await notify(message.chat.id, "Укажите число: /setmaxwarns <n>", 10)
+        text = "Укажите число: /setmaxwarns <n>"
+        await (message.answer(text) if message.chat.type == ChatType.PRIVATE else notify(chat_id, text, 10))
         return
     n = int(command.args.strip())
     if not 1 <= n <= 20:
-        await notify(message.chat.id, "Допустимый диапазон: 1–20", 10)
+        text = "Допустимый диапазон: 1–20"
+        await (message.answer(text) if message.chat.type == ChatType.PRIVATE else notify(chat_id, text, 10))
         return
-    await set_setting(message.chat.id, "max_warns", n)
-    await safe_delete(message.chat.id, message.message_id)
-    await notify(message.chat.id, f"✅ Авто-бан после <b>{n}</b> предупреждений.", 10)
+    await set_setting(chat_id, "max_warns", n)
+    text = f"✅ Авто-бан после <b>{n}</b> предупреждений."
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer(text)
+    else:
+        await safe_delete(chat_id, message.message_id)
+        await notify(chat_id, text, 10)
 
 
-@router.message(Command("antilinks"), IsGroupAdmin())
+@router.message(Command("antilinks"))
 async def cmd_antilinks(message: Message, command: CommandObject) -> None:
+    chat_id = await get_panel_chat_id(message)
+    if not chat_id:
+        return
     if not command.args or command.args.lower() not in ("on", "off"):
-        await notify(message.chat.id, "Используйте: /antilinks on|off", 10)
+        text = "Используйте: /antilinks on|off"
+        await (message.answer(text) if message.chat.type == ChatType.PRIVATE else notify(chat_id, text, 10))
         return
     val = 1 if command.args.lower() == "on" else 0
-    await set_setting(message.chat.id, "anti_links", val)
-    await safe_delete(message.chat.id, message.message_id)
-    await notify(message.chat.id, f"🔗 Фильтр ссылок: {'✅ включён' if val else '❌ отключён'}.", 10)
+    await set_setting(chat_id, "anti_links", val)
+    text = f"🔗 Фильтр ссылок: {'✅ включён' if val else '❌ отключён'}."
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer(text)
+    else:
+        await safe_delete(chat_id, message.message_id)
+        await notify(chat_id, text, 10)
 
 
-@router.message(Command("setsub"), IsGroupAdmin())
-async def cmd_setsub(message: Message, command: CommandObject) -> None:
-    if not command.args:
-        await notify(message.chat.id, "Укажите канал: /setsub @channel или ID", 10)
-        return
-    await set_setting(message.chat.id, "sub_channel", command.args.strip())
-    await safe_delete(message.chat.id, message.message_id)
-    await notify(message.chat.id, f"✅ Канал подписки: <b>{command.args.strip()}</b>", 10)
+@router.message(Command("setsub"))
+async def cmd_setsub(message: Message) -> None:
+    # Канал подписки теперь глобальный — команда информирует об этом
+    text = f"📡 Используется глобальный канал подписки: <code>{GLOBAL_SUB_CHANNEL}</code>\nИзменить его можно только в конфигурации бота."
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer(text)
+    else:
+        await safe_delete(message.chat.id, message.message_id)
+        await notify(message.chat.id, text, 15)
 
 
-@router.message(Command("sub"), IsGroupAdmin())
+@router.message(Command("sub"))
 async def cmd_sub(message: Message, command: CommandObject) -> None:
+    chat_id = await get_panel_chat_id(message)
+    if not chat_id:
+        return
     if not command.args or command.args.lower() not in ("on", "off"):
-        await notify(message.chat.id, "Используйте: /sub on|off", 10)
+        text = "Используйте: /sub on|off"
+        await (message.answer(text) if message.chat.type == ChatType.PRIVATE else notify(chat_id, text, 10))
         return
     val = 1 if command.args.lower() == "on" else 0
-    await set_setting(message.chat.id, "sub_check", val)
-    await safe_delete(message.chat.id, message.message_id)
-    await notify(message.chat.id, f"📡 Проверка подписки: {'✅ включена' if val else '❌ отключена'}.", 10)
+    await set_setting(chat_id, "sub_check", val)
+    text = f"📡 Проверка подписки: {'✅ включена' if val else '❌ отключена'}."
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer(text)
+    else:
+        await safe_delete(chat_id, message.message_id)
+        await notify(chat_id, text, 10)
 
 
-@router.message(Command("nightmode"), IsGroupAdmin())
+@router.message(Command("nightmode"))
 async def cmd_nightmode(message: Message, command: CommandObject) -> None:
+    chat_id = await get_panel_chat_id(message)
+    if not chat_id:
+        return
     if not command.args:
-        await notify(
-            message.chat.id,
-            "Используйте: /nightmode on|off [начало] [конец]\nПример: /nightmode on 23 8",
-            10,
-        )
+        text = "Используйте: /nightmode on|off [начало] [конец]\nПример: /nightmode on 23 8"
+        await (message.answer(text) if message.chat.type == ChatType.PRIVATE else notify(chat_id, text, 10))
         return
     parts = command.args.split()
     mode = parts[0].lower()
     if mode not in ("on", "off"):
-        await notify(message.chat.id, "Используйте on или off.", 10)
+        text = "Используйте on или off."
+        await (message.answer(text) if message.chat.type == ChatType.PRIVATE else notify(chat_id, text, 10))
         return
     val = 1 if mode == "on" else 0
-    await set_setting(message.chat.id, "night_mode", val)
+    await set_setting(chat_id, "night_mode", val)
     if val and len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
-        await set_setting(message.chat.id, "night_start", int(parts[1]))
-        await set_setting(message.chat.id, "night_end", int(parts[2]))
-    await safe_delete(message.chat.id, message.message_id)
-    await notify(message.chat.id, f"🌙 Ночной режим: {'✅ включён' if val else '❌ отключён'}.", 10)
+        await set_setting(chat_id, "night_start", int(parts[1]))
+        await set_setting(chat_id, "night_end", int(parts[2]))
+    text = f"🌙 Ночной режим: {'✅ включён' if val else '❌ отключён'}."
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer(text)
+    else:
+        await safe_delete(chat_id, message.message_id)
+        await notify(chat_id, text, 10)
 
 
-@router.message(Command("captcha"), IsGroupAdmin())
+@router.message(Command("captcha"))
 async def cmd_captcha(message: Message, command: CommandObject) -> None:
+    chat_id = await get_panel_chat_id(message)
+    if not chat_id:
+        return
     if not command.args or command.args.lower() not in ("on", "off"):
-        await notify(message.chat.id, "Используйте: /captcha on|off", 10)
+        text = "Используйте: /captcha on|off"
+        await (message.answer(text) if message.chat.type == ChatType.PRIVATE else notify(chat_id, text, 10))
         return
     val = 1 if command.args.lower() == "on" else 0
-    await set_setting(message.chat.id, "captcha", val)
-    await safe_delete(message.chat.id, message.message_id)
-    await notify(message.chat.id, f"🤖 Капча: {'✅ включена' if val else '❌ отключена'}.", 10)
+    await set_setting(chat_id, "captcha", val)
+    text = f"🤖 Капча: {'✅ включена' if val else '❌ отключена'}."
+    if message.chat.type == ChatType.PRIVATE:
+        await message.answer(text)
+    else:
+        await safe_delete(chat_id, message.message_id)
+        await notify(chat_id, text, 10)
 
 
 # ─── NEW MEMBER / CAPTCHA ──────────────────────────────────────────────────────
@@ -1041,6 +1328,8 @@ async def on_new_member(event: ChatMemberUpdated) -> None:
     user = event.new_chat_member.user
     if user.is_bot:
         return
+
+    await register_chat(chat_id, event.chat.title or "")
 
     captcha_enabled = await get_setting(chat_id, "captcha")
     welcome_msg = await get_setting(chat_id, "welcome_msg") or "Добро пожаловать, {name}! 👋"
@@ -1198,6 +1487,8 @@ async def filter_messages(message: Message) -> None:
     uid = message.from_user.id
     chat_id = message.chat.id
 
+    await register_chat(chat_id, message.chat.title or "")
+
     # Admins are exempt from all filters
     if await is_admin(chat_id, uid):
         await increment_stat(chat_id, uid, "messages")
@@ -1301,35 +1592,33 @@ async def filter_messages(message: Message) -> None:
     # ── Subscription check ─────────────────────────────────────────────────────
     sub_check = await get_setting(chat_id, "sub_check")
     if sub_check:
-        sub_channel = await get_setting(chat_id, "sub_channel")
-        if sub_channel:
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute(
-                    "SELECT 1 FROM subscribed_users WHERE chat_id=? AND user_id=?",
-                    (chat_id, uid),
-                ) as cur:
-                    already_subbed = await cur.fetchone()
-            if not already_subbed:
-                try:
-                    member = await bot.get_chat_member(sub_channel, uid)
-                    if member.status not in ("left", "kicked"):
-                        async with aiosqlite.connect(DB_PATH) as db:
-                            await db.execute(
-                                "INSERT OR IGNORE INTO subscribed_users (chat_id, user_id) VALUES (?,?)",
-                                (chat_id, uid),
-                            )
-                            await db.commit()
-                    else:
-                        await safe_delete(chat_id, message.message_id)
-                        await notify(
-                            chat_id,
-                            f"📡 {user_mention(message.from_user)}, подпишитесь на "
-                            f"{sub_channel} для участия в чате!",
-                            20,
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT 1 FROM subscribed_users WHERE chat_id=? AND user_id=?",
+                (chat_id, uid),
+            ) as cur:
+                already_subbed = await cur.fetchone()
+        if not already_subbed:
+            try:
+                member = await bot.get_chat_member(GLOBAL_SUB_CHANNEL, uid)
+                if member.status not in ("left", "kicked"):
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute(
+                            "INSERT OR IGNORE INTO subscribed_users (chat_id, user_id) VALUES (?,?)",
+                            (chat_id, uid),
                         )
-                        return
-                except Exception:
-                    pass
+                        await db.commit()
+                else:
+                    await safe_delete(chat_id, message.message_id)
+                    await notify(
+                        chat_id,
+                        f"📡 {user_mention(message.from_user)}, подпишитесь на наш канал "
+                        f"для участия в чате!",
+                        20,
+                    )
+                    return
+            except Exception:
+                pass
 
 
 # ─── SCHEDULED TASKS ───────────────────────────────────────────────────────────
