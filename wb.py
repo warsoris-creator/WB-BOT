@@ -1177,25 +1177,39 @@ async def cmd_clearwarns(message: Message) -> None:
 # ─── FORBIDDEN WORDS ───────────────────────────────────────────────────────────
 
 @router.message(Command("add_word"), IsGroupAdmin())
-async def cmd_add_word(message: Message, command: CommandObject) -> None:
-    if not command.args:
-        await notify(message.chat.id, "Укажите слово: /add_word <слово|/regex/>", 10)
+async def cmd_add_word(message: Message) -> None:
+    # Берём всё после первой строки с командой (поддержка многострочного ввода)
+    raw = message.text or ""
+    # Убираем саму команду (/add_word[@bot])
+    lines = raw.split("\n")
+    first_line_rest = lines[0].split(maxsplit=1)
+    words_raw = []
+    if len(first_line_rest) > 1:
+        words_raw.append(first_line_rest[1].strip())
+    words_raw.extend(line.strip() for line in lines[1:])
+    words = [w for w in words_raw if w]
+
+    if not words:
+        await notify(message.chat.id, "Укажите слова:\n/add_word слово1\nслово2\nслово3", 10)
         return
-    word = command.args.strip()
-    is_regex = word.startswith("/") and word.endswith("/") and len(word) > 2
-    if is_regex:
-        word = word[1:-1]
+
+    added = []
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO forbidden_words (chat_id, word, is_regex) VALUES (?,?,?)",
-            (message.chat.id, word, 1 if is_regex else 0),
-        )
+        for word in words:
+            is_regex = word.startswith("/") and word.endswith("/") and len(word) > 2
+            if is_regex:
+                word = word[1:-1]
+            await db.execute(
+                "INSERT INTO forbidden_words (chat_id, word, is_regex) VALUES (?,?,?)",
+                (message.chat.id, word, 1 if is_regex else 0),
+            )
+            added.append(f"<code>{word}</code>{'  (regex)' if is_regex else ''}")
         await db.commit()
     await safe_delete(message.chat.id, message.message_id)
     await notify(
         message.chat.id,
-        f"✅ Добавлено: <code>{word}</code>{'  (regex)' if is_regex else ''}",
-        10,
+        f"✅ Добавлено ({len(added)}):\n" + "\n".join(added),
+        15,
     )
 
 
