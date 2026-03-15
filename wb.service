@@ -1,0 +1,12 @@
+[Unit]
+Description=Your Telegram Bot
+After=network.target
+
+[Service]
+User=wb
+Group=wb
+WorkingDirectory=/home/wb/wb
+ExecStart=/home/wb/wb/.venv/bin/python /home/wb/wb/wb.py
+
+[Install]
+WantedBy=multi-user.target
