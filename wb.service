@@ -1,12 +1,18 @@
 [Unit]
-Description=Your Telegram Bot
+Description=WB-BOT V2 — Telegram Moderator Bot
 After=network.target
+Wants=network-online.target
 
 [Service]
 User=wb
 Group=wb
 WorkingDirectory=/home/wb/wb
+EnvironmentFile=/home/wb/wb/.env
 ExecStart=/home/wb/wb/.venv/bin/python /home/wb/wb/wb.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
