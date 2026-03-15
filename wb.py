@@ -202,7 +202,8 @@ async def is_admin(chat_id: int, user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
-    except Exception:
+    except Exception as e:
+        log.warning("is_admin(%s, %s) failed: %s", chat_id, user_id, e)
         return False
 
 
@@ -336,8 +337,12 @@ async def do_unmute(chat_id: int, user_id: int) -> None:
 class IsGroupAdmin(Filter):
     async def __call__(self, message: Message) -> bool:
         if message.chat.type == ChatType.PRIVATE:
+            await message.reply("Эта команда работает только в группах.")
             return False
-        return await is_admin(message.chat.id, message.from_user.id)
+        result = await is_admin(message.chat.id, message.from_user.id)
+        if not result:
+            await message.reply("⛔ Недостаточно прав.")
+        return result
 
 
 # ─── /start ────────────────────────────────────────────────────────────────────
